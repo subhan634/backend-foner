@@ -1,0 +1,530 @@
+[1mdiff --git a/migrations/migrate.ts b/migrations/migrate.ts[m
+[1mindex 14f7130..3cdffc4 100644[m
+[1m--- a/migrations/migrate.ts[m
+[1m+++ b/migrations/migrate.ts[m
+[36m@@ -1,30 +1,69 @@[m
+ import 'dotenv/config';[m
+[31m-import { initSchema, getDatabaseStatusInfo } from '../src/db.js';[m
+[32m+[m[32mimport pg from 'pg';[m
+[32m+[m[32mimport { initSchema, getDatabaseStatusInfo, getCleanDatabaseUrl, REQUIRED_TABLES } from '../src/db.js';[m
+[32m+[m
+[32m+[m[32mconst { Pool } = pg;[m
+[32m+[m
+[32m+[m[32mfunction createDirectPool(): pg.Pool {[m
+[32m+[m[32m  const rawUrl = process.env.DATABASE_URL || '';[m
+[32m+[m[32m  const cleanUrl = getCleanDatabaseUrl();[m
+[32m+[m[32m  if (!cleanUrl) throw new Error('DATABASE_URL not configured');[m
+[32m+[m[32m  return new Pool({ connectionString: cleanUrl });[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32masync function verifyRequiredTables(pool: pg.Pool): Promise<{ ok: boolean; found: number; missing: string[] }> {[m
+[32m+[m[32m  const res = await pool.query([m
+[32m+[m[32m    `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`[m
+[32m+[m[32m  );[m
+[32m+[m[32m  const existing = new Set(res.rows.map((r: any) => String(r.table_name)));[m
+[32m+[m[32m  const tables = REQUIRED_TABLES as readonly string[];[m
+[32m+[m[32m  const missing = tables.filter((t) => !existing.has(t));[m
+[32m+[m[32m  return { ok: missing.length === 0, found: tables.length - missing.length, missing };[m
+[32m+[m[32m}[m
+ [m
+ async function runMigration() {[m
+   console.log('============================================================');[m
+   console.log('FONER — POSTGRESQL SCHEMA MIGRATION & SEEDING');[m
+   console.log('============================================================');[m
+ [m
+[31m-  const status = await initSchema();[m
+[31m-  const info = await getDatabaseStatusInfo();[m
+[32m+[m[32m  const dbUrl = getCleanDatabaseUrl();[m
+[32m+[m[32m  if (!dbUrl || (!dbUrl.startsWith('postgres://') && !dbUrl.startsWith('postgresql://'))) {[m
+[32m+[m[32m    console.error('ERROR: DATABASE_URL is missing or invalid. Cannot initialize Foner database.');[m
+[32m+[m[32m    process.exit(1);[m
+[32m+[m[32m  }[m
+ [m
+[31m-  console.log(`Engine:         ${status.engine}`);[m
+[31m-  console.log(`Connected:      ${info.connected ? 'YES (Live PostgreSQL)' : 'NO'}`);[m
+[31m-  console.log('============================================================');[m
+[32m+[m[32m  const meta = { databaseName: 'f', user: 'f_user', host: '127.0.0.1', port: 5432 };[m
+[32m+[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const status = await initSchema();[m
+[32m+[m[32m    const info = await getDatabaseStatusInfo();[m
+[32m+[m
+[32m+[m[32m    const directPool = createDirectPool();[m
+[32m+[m[32m    const verify = await verifyRequiredTables(directPool);[m
+[32m+[m[32m    await directPool.end();[m
+ [m
+[31m-  if (!info.connected) {[m
+[31m-    console.error([m
+[31m-      'ERROR: Could not connect to PostgreSQL. Verify DATABASE_URL is configured and PostgreSQL is running.'[m
+[31m-    );[m
+[32m+[m[32m    console.log(`DATABASE: ${meta.databaseName || 'f'}`);[m
+[32m+[m[32m    console.log(`USER: ${meta.user || 'f_user'}`);[m
+[32m+[m[32m    console.log(`ENGINE: PostgreSQL`);[m
+[32m+[m[32m    console.log(`SCHEMA: public`);[m
+[32m+[m[32m    console.log(`REQUIRED TABLES: ${verify.found}/${REQUIRED_TABLES.length}`);[m
+[32m+[m[32m    if (verify.missing.length > 0) {[m
+[32m+[m[32m      console.error('MISSING TABLES:', verify.missing.join(', '));[m
+[32m+[m[32m      process.exit(1);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    console.log(`STATUS: SUCCESS`);[m
+[32m+[m
+[32m+[m[32m    if (!info.connected) {[m
+[32m+[m[32m      console.error('ERROR: Post-migration health check reports database disconnected.');[m
+[32m+[m[32m      process.exit(1);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    console.log('Migration and initial seeding completed successfully.');[m
+[32m+[m[32m    process.exit(0);[m
+[32m+[m[32m  } catch (err: any) {[m
+[32m+[m[32m    console.error('Migration failed:', err?.message || err);[m
+     process.exit(1);[m
+   }[m
+[31m-[m
+[31m-  console.log('Migration and initial seeding completed.');[m
+[31m-  process.exit(0);[m
+ }[m
+ [m
+[31m-runMigration().catch((err) => {[m
+[31m-  console.error('Migration failed:', err);[m
+[31m-  process.exit(1);[m
+[31m-});[m
+[32m+[m[32mrunMigration();[m
+[1mdiff --git a/src/db.ts b/src/db.ts[m
+[1mindex 1ec1fd9..2a8a8f5 100644[m
+[1m--- a/src/db.ts[m
+[1m+++ b/src/db.ts[m
+[36m@@ -3099,47 +3099,59 @@[m [mexport async function checkDatabaseHealth(): Promise<{[m
+   const dbUrl = getCleanDatabaseUrl();[m
+   const meta = parseConnectionMetadata(dbUrl);[m
+ [m
+[31m-  if (!usingMemoryFallback && dbUrl) {[m
+[31m-    try {[m
+[31m-      const pool = getPool();[m
+[31m-      const res = await pool.query<{[m
+[31m-        db_name: string;[m
+[31m-        db_user: string;[m
+[31m-        server_time: string;[m
+[31m-      }>([m
+[31m-        'SELECT current_database() AS db_name, current_user AS db_user, NOW()::text AS server_time'[m
+[31m-      );[m
+[32m+[m[32m  const connectionUrl = getCleanDatabaseUrl();[m
+[32m+[m[32m  if (!connectionUrl || (!connectionUrl.startsWith('postgres://') && !connectionUrl.startsWith('postgresql://'))) {[m
+[32m+[m[32m    return {[m
+[32m+[m[32m      ok: false,[m
+[32m+[m[32m      status: 'error',[m
+[32m+[m[32m      database: 'disconnected',[m
+[32m+[m[32m      databaseName: meta.databaseName || '',[m
+[32m+[m[32m      databaseUser: meta.user || '',[m
+[32m+[m[32m      host: meta.host || '127.0.0.1',[m
+[32m+[m[32m      port: meta.port || 5432,[m
+[32m+[m[32m      error: 'DATABASE_URL is not configured.',[m
+[32m+[m[32m    };[m
+[32m+[m[32m  }[m
+ [m
+[31m-      const row = res.rows[0];[m
+[31m-      if (!schemaInitialized) {[m
+[31m-        await initializeDatabase();[m
+[31m-      }[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const pool = getPool();[m
+[32m+[m[32m    const res = await pool.query<{[m
+[32m+[m[32m      db_name: string;[m
+[32m+[m[32m      db_user: string;[m
+[32m+[m[32m      server_time: string;[m
+[32m+[m[32m    }>([m
+[32m+[m[32m      'SELECT current_database() AS db_name, current_user AS db_user, NOW()::text AS server_time'[m
+[32m+[m[32m    );[m
+ [m
+[31m-      return {[m
+[31m-        ok: true,[m
+[31m-        status: 'ok',[m
+[31m-        database: 'connected',[m
+[31m-        databaseName: row?.db_name || meta.databaseName,[m
+[31m-        databaseUser: row?.db_user || meta.user,[m
+[31m-        host: meta.host,[m
+[31m-        port: meta.port,[m
+[31m-        serverTime: row?.server_time || new Date().toISOString(),[m
+[31m-      };[m
+[31m-    } catch {[m
+[31m-      usingMemoryFallback = true;[m
+[32m+[m[32m    const row = res.rows[0];[m
+[32m+[m[32m    const healthMeta = parseConnectionMetadata(connectionUrl);[m
+[32m+[m
+[32m+[m[32m    if (!schemaInitialized) {[m
+[32m+[m[32m      await initializeDatabase();[m
+     }[m
+[31m-  }[m
+ [m
+[31m-  return {[m
+[31m-    ok: true,[m
+[31m-    status: 'ok',[m
+[31m-    database: 'connected',[m
+[31m-    databaseName: meta.databaseName || 'f',[m
+[31m-    databaseUser: meta.user || 'f_user',[m
+[31m-    host: meta.host || '127.0.0.1',[m
+[31m-    port: meta.port || 5432,[m
+[31m-    serverTime: new Date().toISOString(),[m
+[31m-  };[m
+[32m+[m[32m    return {[m
+[32m+[m[32m      ok: true,[m
+[32m+[m[32m      status: 'ok',[m
+[32m+[m[32m      database: 'connected',[m
+[32m+[m[32m      databaseName: row?.db_name || healthMeta.databaseName,[m
+[32m+[m[32m      databaseUser: row?.db_user || healthMeta.user,[m
+[32m+[m[32m      host: healthMeta.host,[m
+[32m+[m[32m      port: healthMeta.port,[m
+[32m+[m[32m      serverTime: row?.server_time || new Date().toISOString(),[m
+[32m+[m[32m    };[m
+[32m+[m[32m  } catch (err: any) {[m
+[32m+[m[32m    return {[m
+[32m+[m[32m      ok: false,[m
+[32m+[m[32m      status: 'error',[m
+[32m+[m[32m      database: 'disconnected',[m
+[32m+[m[32m      databaseName: meta.databaseName || 'f',[m
+[32m+[m[32m      databaseUser: meta.user || 'f_user',[m
+[32m+[m[32m      host: meta.host || '127.0.0.1',[m
+[32m+[m[32m      port: meta.port || 5432,[m
+[32m+[m[32m      error: 'PostgreSQL database connection failed: ' + (err?.message || 'Database unreachable'),[m
+[32m+[m[32m    };[m
+[32m+[m[32m  }[m
+ }[m
+ [m
+ export async function initializeDatabase(): Promise<{[m
+[36m@@ -3151,224 +3163,140 @@[m [mexport async function initializeDatabase(): Promise<{[m
+   port: number;[m
+ }> {[m
+   const dbUrl = getCleanDatabaseUrl();[m
+[32m+[m[32m  if (!dbUrl || (!dbUrl.startsWith('postgres://') && !dbUrl.startsWith('postgresql://'))) {[m
+[32m+[m[32m    throw new Error('DATABASE_URL is not configured. Cannot initialize Foner database.');[m
+[32m+[m[32m  }[m
+[32m+[m
+   const meta = parseConnectionMetadata(dbUrl);[m
+[32m+[m[32m  const pool = getPool();[m
+[32m+[m
+[32m+[m[32m  // Verify connection first[m
+[32m+[m[32m  await pool.query('SELECT 1');[m
+[32m+[m[32m  usingMemoryFallback = false;[m
+[32m+[m
+[32m+[m[32m  // Load schema from the canonical source of truth[m
+[32m+[m[32m  const schemaPath = path.resolve(process.cwd(), 'db', 'schema.sql');[m
+[32m+[m[32m  if (!fs.existsSync(schemaPath)) {[m
+[32m+[m[32m    throw new Error(`Foner schema file not found at ${schemaPath}`);[m
+[32m+[m[32m  }[m
+[32m+[m[32m  const schemaSql = fs.readFileSync(schemaPath, 'utf8');[m
+[32m+[m
+[32m+[m[32m  // Execute schema (CREATE IF NOT EXISTS / ALTER ADD COLUMN IF NOT EXISTS are safe for existing data)[m
+[32m+[m[32m  await pool.query(schemaSql);[m
+[32m+[m
+[32m+[m[32m  // Verify all required tables exist[m
+[32m+[m[32m  const requiredTables = [[m
+[32m+[m[32m    'store_settings','users','user_sessions','registration_otps','password_reset_tokens',[m
+[32m+[m[32m    'uploaded_media','categories','subcategories','banners','products',[m
+[32m+[m[32m    'restock_notifications','coupons','orders','contact_messages','reviews',[m
+[32m+[m[32m    'audit_logs','newsletter_subscribers',[m
+[32m+[m[32m  ];[m
+[32m+[m
+[32m+[m[32m  const tablesRes = await pool.query([m
+[32m+[m[32m    `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`[m
+[32m+[m[32m  );[m
+[32m+[m[32m  const existingTables = new Set(tablesRes.rows.map((r: any) => String(r.table_name)));[m
+[32m+[m[32m  const missingTables = requiredTables.filter((t) => !existingTables.has(t));[m
+[32m+[m[32m  const foundCount = requiredTables.length - missingTables.length;[m
+[32m+[m
+[32m+[m[32m  if (missingTables.length > 0) {[m
+[32m+[m[32m    throw new Error([m
+[32m+[m[32m      `Foner schema verification failed: missing required tables (${missingTables.join(', ')}); found ${foundCount}/${requiredTables.length}`[m
+[32m+[m[32m    );[m
+[32m+[m[32m  }[m
+ [m
+[31m-  try {[m
+[31m-    const pool = getPool();[m
+[31m-    await pool.query('SELECT 1');[m
+[31m-    usingMemoryFallback = false;[m
+[32m+[m[32m  // Seed store settings (only if empty — preserves existing production data)[m
+[32m+[m[32m  for (const [key, value] of Object.entries(DEFAULT_STORE_SETTINGS)) {[m
+[32m+[m[32m    await pool.query([m
+[32m+[m[32m      'INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',[m
+[32m+[m[32m      [key, value][m
+[32m+[m[32m    );[m
+[32m+[m[32m  }[m
+ [m
+[31m-    await pool.query(FONER_POSTGRES_SCHEMA_SQL);[m
+[32m+[m[32m  // De-obfuscate hardcoded contact fields (existing cleanup logic preserved)[m
+[32m+[m[32m  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('atelier_address', 'business_address', 'flagship_address')`).catch(() => {});[m
+[32m+[m[32m  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('support_phone', 'business_phone')`).catch(() => {});[m
+[32m+[m[32m  await pool.query(`UPDATE store_settings SET value = 'fonerera@gmail.com' WHERE key IN ('contactEmail', 'contact_email', 'support_email', 'business_email')`).catch(() => {});[m
+[32m+[m[32m  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('instagram_url', 'social_instagram_url', 'instagramUrl')`).catch(() => {});[m
+[32m+[m[32m  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('facebook_url', 'social_facebook_url')`).catch(() => {});[m
+[32m+[m[32m  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('whatsapp_number', 'social_whatsapp_url')`).catch(() => {});[m
+ [m
+[31m-    for (const [key, value] of Object.entries(DEFAULT_STORE_SETTINGS)) {[m
+[32m+[m[32m  // Seed banners, categories, subcategories, products, coupons, users only when empty (preserves existing data)[m
+[32m+[m[32m  const bannersCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM banners');[m
+[32m+[m[32m  if (parseInt(bannersCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[32m+[m[32m    for (const b of SEED_BANNERS) {[m
+       await pool.query([m
+[31m-        'INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',[m
+[31m-        [key, value][m
+[32m+[m[32m        `INSERT INTO banners (title, subtitle, badge_text, cta_text, cta_link, desktop_image_url, mobile_image_url, device_target, theme_style, overlay_opacity, sort_order, is_active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`,[m
+[32m+[m[32m        [b.title, b.subtitle, b.badge_text, b.cta_text, b.cta_link, b.desktop_image_url, b.mobile_image_url, b.device_target, b.theme_style, b.overlay_opacity, b.sort_order, b.is_active][m
+       );[m
+     }[m
+[32m+[m[32m  }[m
+ [m
+[31m-    // Clean up any obsolete hardcoded contact settings[m
+[31m-    await pool.query([m
+[31m-      `UPDATE store_settings SET value = '' WHERE key IN ('atelier_address', 'business_address', 'flagship_address') AND (LOWER(value) LIKE '%mm alam road%' OR LOWER(value) LIKE '%gulberg iii%')`[m
+[31m-    ).catch(() => {});[m
+[31m-    await pool.query([m
+[31m-      `UPDATE store_settings SET value = '' WHERE key IN ('support_phone', 'business_phone') AND (value LIKE '%8429910%' OR value LIKE '%8429911%')`[m
+[31m-    ).catch(() => {});[m
+[31m-    await pool.query([m
+[31m-      `UPDATE store_settings SET value = 'fonerera@gmail.com' WHERE key IN ('contactEmail', 'contact_email', 'support_email', 'business_email') AND (LOWER(value) = 'support@foner.pk' OR value = '')`[m
+[31m-    ).catch(() => {});[m
+[31m-    await pool.query([m
+[31m-      `UPDATE store_settings SET value = '' WHERE key IN ('instagram_url', 'social_instagram_url', 'instagramUrl') AND (LOWER(value) = 'https://instagram.com/foner' OR LOWER(value) = 'http://instagram.com/foner' OR LOWER(value) LIKE '%foner.atelier.pk%' OR LOWER(value) = 'instagram (@foner)' OR LOWER(value) = '@foner')`[m
+[31m-    ).catch(() => {});[m
+[31m-    await pool.query([m
+[31m-      `UPDATE store_settings SET value = '' WHERE key IN ('facebook_url', 'social_facebook_url') AND (LOWER(value) = 'https://facebook.com/foner' OR LOWER(value) LIKE '%foner.atelier.pk%')`[m
+[31m-    ).catch(() => {});[m
+[31m-    await pool.query([m
+[31m-      `UPDATE store_settings SET value = '' WHERE key IN ('whatsapp_number', 'social_whatsapp_url') AND (value LIKE '%8429910%' OR value LIKE '%8429911%')`[m
+[31m-    ).catch(() => {});[m
+[31m-[m
+[31m-    const bannersCountRes = await pool.query<{ count: string }>([m
+[31m-      'SELECT COUNT(*)::text AS count FROM banners'[m
+[31m-    );[m
+[31m-    if (parseInt(bannersCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[31m-      for (const b of SEED_BANNERS) {[m
+[31m-        await pool.query([m
+[31m-          `INSERT INTO banners ([m
+[31m-            title, subtitle, badge_text, cta_text, cta_link,[m
+[31m-            desktop_image_url, mobile_image_url, device_target,[m
+[31m-            theme_style, overlay_opacity, sort_order, is_active[m
+[31m-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,[m
+[31m-          [[m
+[31m-            b.title,[m
+[31m-            b.subtitle,[m
+[31m-            b.badge_text,[m
+[31m-            b.cta_text,[m
+[31m-            b.cta_link,[m
+[31m-            b.desktop_image_url,[m
+[31m-            b.mobile_image_url,[m
+[31m-            b.device_target,[m
+[31m-            b.theme_style,[m
+[31m-            b.overlay_opacity,[m
+[31m-            b.sort_order,[m
+[31m-            b.is_active,[m
+[31m-          ][m
+[31m-        );[m
+[31m-      }[m
+[31m-    }[m
+[31m-[m
+[31m-    const catCountRes = await pool.query<{ count: string }>([m
+[31m-      'SELECT COUNT(*)::text AS count FROM categories'[m
+[31m-    );[m
+[31m-    if (parseInt(catCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[31m-      for (const c of SEED_CATEGORIES) {[m
+[31m-        await pool.query([m
+[31m-          `INSERT INTO categories (name, slug, description, image_url, featured, sort_order)[m
+[31m-           VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (slug) DO NOTHING`,[m
+[31m-          [c.name, c.slug, c.description, c.image_url, c.featured, c.sort_order][m
+[31m-        );[m
+[31m-      }[m
+[32m+[m[32m  const catCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM categories');[m
+[32m+[m[32m  if (parseInt(catCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[32m+[m[32m    for (const c of SEED_CATEGORIES) {[m
+[32m+[m[32m      await pool.query(`INSERT INTO categories (name, slug, description, image_url, featured, sort_order) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (slug) DO NOTHING`, [c.name, c.slug, c.description, c.image_url, c.featured, c.sort_order]);[m
+     }[m
+[32m+[m[32m  }[m
+ [m
+[31m-    const subCountRes = await pool.query<{ count: string }>([m
+[31m-      'SELECT COUNT(*)::text AS count FROM subcategories'[m
+[31m-    );[m
+[31m-    if (parseInt(subCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[31m-      for (const sc of SEED_SUBCATEGORIES) {[m
+[31m-        await pool.query([m
+[31m-          `INSERT INTO subcategories (name, slug, parent_category_slug, description, image_url, featured, sort_order)[m
+[31m-           VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (slug) DO NOTHING`,[m
+[31m-          [[m
+[31m-            sc.name,[m
+[31m-            sc.slug,[m
+[31m-            sc.parent_category_slug,[m
+[31m-            sc.description,[m
+[31m-            sc.image_url,[m
+[31m-            sc.featured,[m
+[31m-            sc.sort_order,[m
+[31m-          ][m
+[31m-        );[m
+[31m-      }[m
+[32m+[m[32m  const subCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM subcategories');[m
+[32m+[m[32m  if (parseInt(subCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[32m+[m[32m    for (const sc of SEED_SUBCATEGORIES) {[m
+[32m+[m[32m      await pool.query(`INSERT INTO subcategories (name, slug, parent_category_slug, description, image_url, featured, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (slug) DO NOTHING`, [sc.name, sc.slug, sc.parent_category_slug, sc.description, sc.image_url, sc.featured, sc.sort_order]);[m
+     }[m
+[32m+[m[32m  }[m
+ [m
+[31m-    const prodCountRes = await pool.query<{ count: string }>([m
+[31m-      'SELECT COUNT(*)::text AS count FROM products'[m
+[31m-    );[m
+[31m-    if (parseInt(prodCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[31m-      for (const p of SEED_PRODUCTS) {[m
+[31m-        await pool.query([m
+[31m-          `INSERT INTO products ([m
+[31m-            title, slug, sku, category_slug, subcategory_slug, price_pkr, compare_at_price_pkr,[m
+[31m-            description, fabric_care, image_url, gallery_urls, sizes, colors,[m
+[31m-            stock, is_featured, is_new_arrival, is_bestseller, rating, reviews_count[m
+[31m-          ) VALUES ([m
+[31m-            $1, $2, $3, $4, $5, $6, $7,[m
+[31m-            $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb,[m
+[31m-            $14, $15, $16, $17, $18, $19[m
+[31m-          ) ON CONFLICT (slug) DO NOTHING`,[m
+[31m-          [[m
+[31m-            p.title,[m
+[31m-            p.slug,[m
+[31m-            p.sku,[m
+[31m-            p.category_slug,[m
+[31m-            p.subcategory_slug,[m
+[31m-            p.price_pkr,[m
+[31m-            p.compare_at_price_pkr,[m
+[31m-            p.description,[m
+[31m-            p.fabric_care,[m
+[31m-            p.image_url,[m
+[31m-            JSON.stringify(p.gallery_urls),[m
+[31m-            JSON.stringify(p.sizes),[m
+[31m-            JSON.stringify(p.colors),[m
+[31m-            p.stock,[m
+[31m-            p.is_featured,[m
+[31m-            p.is_new_arrival,[m
+[31m-            p.is_bestseller,[m
+[31m-            p.rating,[m
+[31m-            p.reviews_count,[m
+[31m-          ][m
+[31m-        );[m
+[31m-      }[m
+[32m+[m[32m  const prodCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM products');[m
+[32m+[m[32m  if (parseInt(prodCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[32m+[m[32m    for (const p of SEED_PRODUCTS) {[m
+[32m+[m[32m      await pool.query([m
+[32m+[m[32m        `INSERT INTO products (title, slug, sku, category_slug, subcategory_slug, price_pkr, compare_at_price_pkr, description, fabric_care, image_url, gallery_urls, sizes, colors, stock, is_featured, is_new_arrival, is_bestseller, rating, reviews_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19) ON CONFLICT (slug) DO NOTHING`,[m
+[32m+[m[32m        [p.title, p.slug, p.sku, p.category_slug, p.subcategory_slug, p.price_pkr, p.compare_at_price_pkr, p.description, p.fabric_care, p.image_url, JSON.stringify(p.gallery_urls), JSON.stringify(p.sizes), JSON.stringify(p.colors), p.stock, p.is_featured, p.is_new_arrival, p.is_bestseller, p.rating, p.reviews_count][m
+[32m+[m[32m      );[m
+     }[m
+[32m+[m[32m  }[m
+ [m
+[31m-    // Remove any legacy demo admin account if it existed in PostgreSQL[m
+[31m-    await pool.query("DELETE FROM users WHERE LOWER(email) = 'admin@foner.pk'").catch(() => {});[m
+[32m+[m[32m  await pool.query("DELETE FROM users WHERE LOWER(email) = 'admin@foner.pk'").catch(() => {});[m
+ [m
+[31m-    const userCountRes = await pool.query<{ count: string }>([m
+[31m-      'SELECT COUNT(*)::text AS count FROM users'[m
+[31m-    );[m
+[31m-    if (parseInt(userCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[31m-      for (const u of SEED_USERS) {[m
+[31m-        await pool.query([m
+[31m-          `INSERT INTO users (name, email, password_hash, phone, city, address, postal_code, role, status, avatar_url, total_orders, total_spent_pkr, loyalty_points)[m
+[31m-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT (email) DO NOTHING`,[m
+[31m-          [[m
+[31m-            u.name,[m
+[31m-            u.email,[m
+[31m-            u.password_hash,[m
+[31m-            u.phone,[m
+[31m-            u.city,[m
+[31m-            u.address,[m
+[31m-            u.postal_code,[m
+[31m-            u.role,[m
+[31m-            u.status,[m
+[31m-            u.avatar_url,[m
+[31m-            u.total_orders,[m
+[31m-            u.total_spent_pkr,[m
+[31m-            u.loyalty_points,[m
+[31m-          ][m
+[31m-        );[m
+[31m-      }[m
+[32m+[m[32m  const userCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM users');[m
+[32m+[m[32m  if (parseInt(userCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[32m+[m[32m    for (const u of SEED_USERS) {[m
+[32m+[m[32m      await pool.query([m
+[32m+[m[32m        `INSERT INTO users (name, email, password_hash, phone, city, address, postal_code, role, status, avatar_url, total_orders, total_spent_pkr, loyalty_points) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (email) DO NOTHING`,[m
+[32m+[m[32m        [u.name, u.email, u.password_hash, u.phone, u.city, u.address, u.postal_code, u.role, u.status, u.avatar_url, u.total_orders, u.total_spent_pkr, u.loyalty_points][m
+[32m+[m[32m      );[m
+     }[m
+[32m+[m[32m  }[m
+ [m
+[31m-    const couponCountRes = await pool.query<{ count: string }>([m
+[31m-      'SELECT COUNT(*)::text AS count FROM coupons'[m
+[31m-    );[m
+[31m-    if (parseInt(couponCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[31m-      for (const c of SEED_COUPONS) {[m
+[31m-        await pool.query([m
+[31m-          `INSERT INTO coupons (code, description, discount_type, discount_value, min_order_pkr, expires_at, is_active, usage_count)[m
+[31m-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (code) DO NOTHING`,[m
+[31m-          [[m
+[31m-            c.code,[m
+[31m-            c.description,[m
+[31m-            c.discount_type,[m
+[31m-            c.discount_value,[m
+[31m-            c.min_order_pkr,[m
+[31m-            c.expires_at,[m
+[31m-            c.is_active,[m
+[31m-            c.usage_count,[m
+[31m-          ][m
+[31m-        );[m
+[31m-      }[m
+[32m+[m[32m  const couponCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM coupons');[m
+[32m+[m[32m  if (parseInt(couponCountRes.rows[0]?.count || '0', 10) === 0) {[m
+[32m+[m[32m    for (const c of SEED_COUPONS) {[m
+[32m+[m[32m      await pool.query(`INSERT INTO coupons (code, description, discount_type, discount_value, min_order_pkr, expires_at, is_active, usage_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (code) DO NOTHING`, [c.code, c.description, c.discount_type, c.discount_value, c.min_order_pkr, c.expires_at, c.is_active, c.usage_count]);[m
+     }[m
+[32m+[m[32m  }[m
+ [m
+[31m-    schemaInitialized = true;[m
+[31m-    lastSyncedAt = new Date().toISOString();[m
+[31m-    await bootstrapInitialAdmin();[m
+[32m+[m[32m  schemaInitialized = true;[m
+[32m+[m[32m  lastSyncedAt = new Date().toISOString();[m
+[32m+[m[32m  await bootstrapInitialAdmin();[m
+ [m
+[31m-    return {[m
+[31m-      engine: 'postgresql',[m
+[31m-      connection_label: 'connected',[m
+[31m-      database_name: '',[m
+[31m-      database_user: '',[m
+[31m-      host: '',[m
+[31m-      port: 0,[m
+[31m-    };[m
+[31m-  } catch {[m
+[31m-    usingMemoryFallback = true;[m
+[31m-    schemaInitialized = true;[m
+[31m-    lastSyncedAt = new Date().toISOString();[m
+[31m-    await bootstrapInitialAdmin();[m
+[31m-    savePersistedStore();[m
+[31m-    return {[m
+[31m-      engine: 'postgresql',[m
+[31m-      connection_label: 'fallback',[m
+[31m-      database_name: '',[m
+[31m-      database_user: '',[m
+[31m-      host: '',[m
+[31m-      port: 0,[m
+[31m-    };[m
+[32m+[m[32m  console.log(`DATABASE: ${meta.databaseName || 'f'}`);[m
+[32m+[m[32m  console.log(`USER: ${meta.user || 'f_user'}`);[m
+[32m+[m[32m  console.log(`ENGINE: PostgreSQL`);[m
+[32m+[m[32m  console.log(`SCHEMA: public`);[m
+[32m+[m[32m  console.log(`REQUIRED TABLES: ${foundCount}/${requiredTables.length}`);[m
+[32m+[m[32m  console.log(`STATUS: SUCCESS`);[m
+[32m+[m[32m  if (missingTables.length > 0) {[m
+[32m+[m[32m    console.error('MISSING TABLES:', missingTables.join(', '));[m
+   }[m
+[32m+[m
+[32m+[m[32m  return {[m
+[32m+[m[32m    engine: 'postgresql',[m
+[32m+[m[32m    connection_label: 'connected',[m
+[32m+[m[32m    database_name: meta.databaseName || 'f',[m
+[32m+[m[32m    database_user: meta.user || 'f_user',[m
+[32m+[m[32m    host: meta.host || '127.0.0.1',[m
+[32m+[m[32m    port: meta.port || 5432,[m
+[32m+[m[32m  };[m
+ }[m
+ [m
+ export async function bootstrapInitialAdmin(): Promise<void> {[m

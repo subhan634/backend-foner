@@ -1719,7 +1719,8 @@ function getPool(): pg.Pool {
     });
 
     pgPool.on('error', () => {
-      usingMemoryFallback = true;
+      // Fail loudly — do not silently switch to memory fallback
+      console.error('[DB Pool Error] PostgreSQL connection failed — memory fallback disabled');
     });
   }
 
@@ -3014,15 +3015,15 @@ export async function dbQuery<T = any>(
   params: any[] = []
 ): Promise<QueryResult<T>> {
   if (usingMemoryFallback) {
-    return executeMemoryQuery<T>(sql, params);
+    throw new Error('PostgreSQL not available — memory fallback disabled in production');
   }
   try {
     const pool = getPool();
     const res = await pool.query(sql, params);
     return { rows: res.rows as T[], rowCount: res.rowCount };
-  } catch {
-    usingMemoryFallback = true;
-    return executeMemoryQuery<T>(sql, params);
+  } catch (err: any) {
+    // Fail loudly — never silently fall back to memory/mock storage
+    throw err;
   }
 }
 
@@ -3049,40 +3050,19 @@ export async function withTransaction<T>(
         client.release();
       }
     } catch (connErr: any) {
-      // Only fall back if connection itself failed before transaction logic threw a business error
-      if (connErr?.isBusinessError) {
-        throw connErr;
-      }
-      usingMemoryFallback = true;
+      // Always fail loudly — never fall back to memory store in production
+      throw connErr;
     }
   }
 
-  // Atomic transaction with snapshot rollback
-  const snapshot = structuredClone(memStore);
-  inTransaction = true;
-  try {
-    const txQuery = async <R = any>(sql: string, params: any[] = []): Promise<QueryResult<R>> => {
-      return executeMemoryQuery<R>(sql, params);
-    };
-    const result = await fn(txQuery);
-    inTransaction = false;
-    savePersistedStore();
-    return result;
-  } catch (err) {
-    memStore = snapshot;
-    inTransaction = false;
-    throw err;
-  }
+  // Memory fallback removed in production — always require PostgreSQL
+  throw new Error('PostgreSQL transaction unavailable — memory fallback disabled');
 }
 
 export async function dbExecBatch(sqlScript: string): Promise<void> {
-  if (usingMemoryFallback) return;
-  try {
-    const pool = getPool();
-    await pool.query(sqlScript);
-  } catch {
-    usingMemoryFallback = true;
-  }
+  // Fail loudly if PG unavailable — no memory fallback
+  const pool = getPool();
+  await pool.query(sqlScript);
 }
 
 export async function checkDatabaseHealth(): Promise<{

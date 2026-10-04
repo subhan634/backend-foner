@@ -2811,13 +2811,10 @@ async function startServer() {
         ordersList = myOrdersRes.rows.map(normalizeOrder);
       }
 
-      const bannersList =
-        bannersRes.rows.length > 0 ? bannersRes.rows.map(normalizeBanner) : SEED_BANNERS.map(normalizeBanner);
-      const categoriesList = categoriesRes.rows.length > 0 ? categoriesRes.rows : SEED_CATEGORIES;
-      const subcategoriesList =
-        subcategoriesRes.rows.length > 0 ? subcategoriesRes.rows : SEED_SUBCATEGORIES;
-      const rawProductsRows =
-        productsRes.rows.length > 0 ? productsRes.rows : SEED_PRODUCTS;
+      const bannersList = bannersRes.rows.map(normalizeBanner);
+      const categoriesList = categoriesRes.rows;
+      const subcategoriesList = subcategoriesRes.rows;
+      const rawProductsRows = productsRes.rows;
       const productsList = enrichProductsWithSales(rawProductsRows, allOrdersForSalesRes.rows);
 
       res.json({
@@ -4626,7 +4623,7 @@ async function startServer() {
       const allOrders = ordersRes.rows.map(normalizeOrder);
       const allProducts = productsRes.rows.map(normalizeProduct);
       const allUsers = usersRes.rows.map(normalizeUser);
-      const allCategories = categoriesRes.rows.length > 0 ? categoriesRes.rows : SEED_CATEGORIES;
+      const allCategories = categoriesRes.rows;
 
       const productById = new Map<number, any>(allProducts.map((p) => [p.id, p]));
       const categoryNameBySlug = new Map<string, string>(
