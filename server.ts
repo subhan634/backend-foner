@@ -1473,11 +1473,9 @@ function getAllowedCorsOrigins(): Set<string> {
 
   if (process.env.NODE_ENV !== 'production') {
     allowed.add('http://localhost:3000');
-    allowed.add('http://localhost:3001');
     allowed.add('http://localhost:5173');
     allowed.add('http://localhost:1420');
     allowed.add('http://127.0.0.1:3000');
-    allowed.add('http://127.0.0.1:3001');
     allowed.add('http://127.0.0.1:5173');
     allowed.add('http://127.0.0.1:1420');
   }
@@ -6188,7 +6186,7 @@ async function startServer() {
   }
 
   const HOST = process.env.HOST || '0.0.0.0';
-  const PORT = Number(process.env.PORT || 3001);
+  const PORT = Number(process.env.PORT || 3000);
   app.listen(PORT, HOST, () => {
     console.log(`Foner Backend listening on http://${HOST}:${PORT}`);
     if (viteServer) {

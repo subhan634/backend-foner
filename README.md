@@ -17,7 +17,7 @@ This backend provides admin-only APIs for managing users, orders, and other enti
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `DATABASE_URL` | PostgreSQL connection string (e.g., `postgresql://user:pass@localhost:5432/foner`) | Yes |
-| `PORT` | Server port (default: `3001`) | No |
+| `PORT` | Server port (default: `3000`) | No |
 | `HOST` | Server host (default: `0.0.0.0`) | No |
 
 ## Setup
@@ -29,7 +29,7 @@ cp .env.example .env
 # Edit .env with your PostgreSQL credentials
 # Example:
 # DATABASE_URL=postgresql://f_user:secret@localhost:5432/foner
-# PORT=3001
+# PORT=3000
 # HOST=0.0.0.0
 
 # Install dependencies
