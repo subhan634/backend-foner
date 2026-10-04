@@ -3201,59 +3201,8 @@ export async function initializeDatabase(): Promise<{
   await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('facebook_url', 'social_facebook_url')`).catch(() => {});
   await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('whatsapp_number', 'social_whatsapp_url')`).catch(() => {});
 
-  // Seed banners, categories, subcategories, products, coupons, users only when empty (preserves existing data)
-  const bannersCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM banners');
-  if (parseInt(bannersCountRes.rows[0]?.count || '0', 10) === 0) {
-    for (const b of SEED_BANNERS) {
-      await pool.query(
-        `INSERT INTO banners (title, subtitle, badge_text, cta_text, cta_link, desktop_image_url, mobile_image_url, device_target, theme_style, overlay_opacity, sort_order, is_active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`,
-        [b.title, b.subtitle, b.badge_text, b.cta_text, b.cta_link, b.desktop_image_url, b.mobile_image_url, b.device_target, b.theme_style, b.overlay_opacity, b.sort_order, b.is_active]
-      );
-    }
-  }
-
-  const catCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM categories');
-  if (parseInt(catCountRes.rows[0]?.count || '0', 10) === 0) {
-    for (const c of SEED_CATEGORIES) {
-      await pool.query(`INSERT INTO categories (name, slug, description, image_url, featured, sort_order) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (slug) DO NOTHING`, [c.name, c.slug, c.description, c.image_url, c.featured, c.sort_order]);
-    }
-  }
-
-  const subCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM subcategories');
-  if (parseInt(subCountRes.rows[0]?.count || '0', 10) === 0) {
-    for (const sc of SEED_SUBCATEGORIES) {
-      await pool.query(`INSERT INTO subcategories (name, slug, parent_category_slug, description, image_url, featured, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (slug) DO NOTHING`, [sc.name, sc.slug, sc.parent_category_slug, sc.description, sc.image_url, sc.featured, sc.sort_order]);
-    }
-  }
-
-  const prodCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM products');
-  if (parseInt(prodCountRes.rows[0]?.count || '0', 10) === 0) {
-    for (const p of SEED_PRODUCTS) {
-      await pool.query(
-        `INSERT INTO products (title, slug, sku, category_slug, subcategory_slug, price_pkr, compare_at_price_pkr, description, fabric_care, image_url, gallery_urls, sizes, colors, stock, is_featured, is_new_arrival, is_bestseller, rating, reviews_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19) ON CONFLICT (slug) DO NOTHING`,
-        [p.title, p.slug, p.sku, p.category_slug, p.subcategory_slug, p.price_pkr, p.compare_at_price_pkr, p.description, p.fabric_care, p.image_url, JSON.stringify(p.gallery_urls), JSON.stringify(p.sizes), JSON.stringify(p.colors), p.stock, p.is_featured, p.is_new_arrival, p.is_bestseller, p.rating, p.reviews_count]
-      );
-    }
-  }
-
-  await pool.query("DELETE FROM users WHERE LOWER(email) = 'admin@foner.pk'").catch(() => {});
-
-  const userCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM users');
-  if (parseInt(userCountRes.rows[0]?.count || '0', 10) === 0) {
-    for (const u of SEED_USERS) {
-      await pool.query(
-        `INSERT INTO users (name, email, password_hash, phone, city, address, postal_code, role, status, avatar_url, total_orders, total_spent_pkr, loyalty_points) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (email) DO NOTHING`,
-        [u.name, u.email, u.password_hash, u.phone, u.city, u.address, u.postal_code, u.role, u.status, u.avatar_url, u.total_orders, u.total_spent_pkr, u.loyalty_points]
-      );
-    }
-  }
-
-  const couponCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM coupons');
-  if (parseInt(couponCountRes.rows[0]?.count || '0', 10) === 0) {
-    for (const c of SEED_COUPONS) {
-      await pool.query(`INSERT INTO coupons (code, description, discount_type, discount_value, min_order_pkr, expires_at, is_active, usage_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (code) DO NOTHING`, [c.code, c.description, c.discount_type, c.discount_value, c.min_order_pkr, c.expires_at, c.is_active, c.usage_count]);
-    }
-  }
+  // Business data seeding explicitly disabled for production (database must remain source of truth)
+  // Schema and store settings preserved; admin account preserved via bootstrapInitialAdmin only
 
   schemaInitialized = true;
   lastSyncedAt = new Date().toISOString();
