@@ -181,35 +181,29 @@ async function sendRegistrationOtpEmail(toEmail: string, toName: string, otpCode
     throw new Error('Transactional email service (SMTP) is not configured on the server.');
   }
 
+  const safeFrom = SMTP_FROM || SMTP_USER || 'fonerera@gmail.com';
+
   const mailOptions = {
-    messageId,
-    from: {
-      name: 'Foner',
-      address: SMTP_FROM,
-    },
-    sender: SMTP_FROM,
-    replyTo: {
-      name: 'Foner',
-      address: SMTP_FROM,
-    },
+    from: safeFrom,
     to: safeName ? `"${safeName}" <${safeEmail}>` : safeEmail,
-    envelope: {
-      from: SMTP_FROM,
-      to: safeEmail,
-    },
     subject: 'Your Foner verification code',
     text: plainText,
     html: htmlBody,
-    headers: {
-      'X-Entity-Ref-ID': crypto.randomUUID(),
-      'Auto-Submitted': 'auto-generated',
-    },
   };
 
   try {
-    return await smtpTransporter.sendMail(mailOptions);
-  } catch {
-    return await smtpTransporter.sendMail(mailOptions);
+    const result = await smtpTransporter.sendMail(mailOptions);
+    return result;
+  } catch (err: any) {
+    const safeLog = {
+      code: err?.code || 'unknown',
+      message: err?.message || 'Send failed',
+      responseCode: err?.responseCode || null,
+      command: err?.command || null,
+      response: typeof err?.response === 'string' ? err.response.substring(0, 200) : null,
+    };
+    console.warn('[SMTP Registration Error] sendMail failed:', safeLog);
+    throw new Error('SMTP send failed: ' + (err?.message || 'Unknown error'));
   }
 }
 
@@ -1930,6 +1924,7 @@ async function startServer() {
   const emailSchema = z.string().trim().toLowerCase().email().max(160);
 
   app.post('/api/auth/send-otp', otpRequestRateLimiter, async (req, res) => {
+    let cleanEmail: string | undefined;
     try {
       const parsedEmail = emailSchema.safeParse(req.body?.email);
       const cleanName = sanitizeText(req.body?.name || '', 100);
@@ -1937,7 +1932,7 @@ async function startServer() {
       if (!parsedEmail.success) {
         return res.status(400).json({ error: 'Please enter a valid email address.' });
       }
-      const cleanEmail = parsedEmail.data;
+      cleanEmail = parsedEmail.data;
 
       // Prevent duplicate account registration on an already-registered email
       const existingUserRes = await dbQuery('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [
@@ -2004,6 +1999,20 @@ async function startServer() {
         message: `A 6-digit verification code has been sent to ${cleanEmail}.`,
       });
     } catch (err: any) {
+      // Safe cleanup: if email delivery failed, remove misleading active OTP
+      try {
+        await dbQuery('DELETE FROM registration_otps WHERE LOWER(email) = LOWER($1)', [cleanEmail]);
+      } catch {
+        // ignore cleanup error
+      }
+      const safeLog = {
+        error_type: 'registration_otp_send_failed',
+        email_domain: cleanEmail ? cleanEmail.split('@')[1] || '' : '',
+        smtp_error_code: err?.code || 'unknown',
+        smtp_message: err?.message || 'Send failed',
+        response_code: err?.responseCode || null,
+      };
+      console.warn('[SMTP Registration OTP Error]', safeLog);
       return res.status(500).json({
         error: 'Unable to send verification OTP email right now. Please verify the email address and try again.',
       });
@@ -2011,6 +2020,7 @@ async function startServer() {
   });
 
   app.post('/api/auth/verify-otp', otpVerifyRateLimiter, async (req, res) => {
+    let cleanEmail: string | undefined;
     try {
       const parsedEmail = emailSchema.safeParse(req.body?.email);
       const cleanOtp = String(req.body?.otp || '').trim();
@@ -2018,7 +2028,7 @@ async function startServer() {
       if (!parsedEmail.success || !/^\d{6}$/.test(cleanOtp)) {
         return res.status(400).json({ error: 'Valid email and 6-digit OTP code are required.' });
       }
-      const cleanEmail = parsedEmail.data;
+      cleanEmail = parsedEmail.data;
 
       const otpRes = await dbQuery('SELECT * FROM registration_otps WHERE LOWER(email) = LOWER($1)', [
         cleanEmail,
@@ -2212,6 +2222,7 @@ async function startServer() {
   app.post('/api/auth/customer/register', authRateLimiter, registerHandler);
 
   const loginHandler: express.RequestHandler = async (req, res) => {
+    let cleanEmail: string | undefined;
     try {
       const parsedEmail = emailSchema.safeParse(req.body?.email);
       const rawPassword = String(req.body?.password || '');
@@ -2219,7 +2230,7 @@ async function startServer() {
       if (!parsedEmail.success || !rawPassword || rawPassword.length > 128) {
         return res.status(400).json({ error: 'Valid email and password are required.' });
       }
-      const cleanEmail = parsedEmail.data;
+      cleanEmail = parsedEmail.data;
       const clientIp = getClientIp(req);
 
       const lockout = checkLoginLockout(cleanEmail, clientIp);
@@ -2289,12 +2300,13 @@ async function startServer() {
   // PASSWORD RESET FLOW (SINGLE-USE HASHED TOKEN, SHORT EXPIRY, SESSION REVOCATION)
   // ============================================================================
   const requestPasswordResetHandler: express.RequestHandler = async (req, res) => {
+    let cleanEmail: string | undefined;
     try {
       const parsedEmail = emailSchema.safeParse(req.body?.email);
       if (!parsedEmail.success) {
         return res.status(400).json({ error: 'Please enter a valid email address.' });
       }
-      const cleanEmail = parsedEmail.data;
+      cleanEmail = parsedEmail.data;
 
       // Generic message to prevent account enumeration
       const genericResponse = {
@@ -2364,6 +2376,7 @@ async function startServer() {
   app.post('/api/auth/forgot-password', otpRequestRateLimiter, requestPasswordResetHandler);
 
   const confirmPasswordResetHandler: express.RequestHandler = async (req, res) => {
+    let cleanEmail: string | undefined;
     try {
       const parsedEmail = emailSchema.safeParse(req.body?.email);
       const cleanOtp = String(req.body?.otp || req.body?.code || req.body?.token || '').trim();
@@ -2387,7 +2400,7 @@ async function startServer() {
           error: 'New password must be between 6 and 128 characters.',
         });
       }
-      const cleanEmail = parsedEmail.data;
+      cleanEmail = parsedEmail.data;
 
       const tokenRes = await dbQuery(
         'SELECT * FROM password_reset_tokens WHERE LOWER(email) = LOWER($1)',
@@ -2562,6 +2575,7 @@ async function startServer() {
   // ADMIN AUTHENTICATION (/api/admin/auth/* & /api/auth/admin/*)
   // ============================================================================
   const adminLoginHandler: express.RequestHandler = async (req, res) => {
+    let cleanEmail: string | undefined;
     try {
       const parsedEmail = emailSchema.safeParse(req.body?.email);
       const rawPassword = String(req.body?.password || '');
@@ -2569,7 +2583,7 @@ async function startServer() {
       if (!parsedEmail.success || !rawPassword || rawPassword.length > 128) {
         return res.status(400).json({ error: 'Admin email and password are required.' });
       }
-      const cleanEmail = parsedEmail.data;
+      cleanEmail = parsedEmail.data;
       const clientIp = getClientIp(req);
 
       const lockout = checkLoginLockout(cleanEmail, clientIp);
@@ -3818,6 +3832,7 @@ async function startServer() {
   );
 
   const createUserHandler: express.RequestHandler = async (req, res) => {
+    let cleanEmail: string | undefined;
     try {
       const {
         name,
@@ -3835,7 +3850,7 @@ async function startServer() {
       if (!cleanName || !parsedEmail.success) {
         return res.status(400).json({ error: 'Valid name and email address are required.' });
       }
-      const cleanEmail = parsedEmail.data;
+      cleanEmail = parsedEmail.data;
 
       const existing = await dbQuery('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [
         cleanEmail,
