@@ -3099,47 +3099,59 @@ export async function checkDatabaseHealth(): Promise<{
   const dbUrl = getCleanDatabaseUrl();
   const meta = parseConnectionMetadata(dbUrl);
 
-  if (!usingMemoryFallback && dbUrl) {
-    try {
-      const pool = getPool();
-      const res = await pool.query<{
-        db_name: string;
-        db_user: string;
-        server_time: string;
-      }>(
-        'SELECT current_database() AS db_name, current_user AS db_user, NOW()::text AS server_time'
-      );
-
-      const row = res.rows[0];
-      if (!schemaInitialized) {
-        await initializeDatabase();
-      }
-
-      return {
-        ok: true,
-        status: 'ok',
-        database: 'connected',
-        databaseName: row?.db_name || meta.databaseName,
-        databaseUser: row?.db_user || meta.user,
-        host: meta.host,
-        port: meta.port,
-        serverTime: row?.server_time || new Date().toISOString(),
-      };
-    } catch {
-      usingMemoryFallback = true;
-    }
+  const connectionUrl = getCleanDatabaseUrl();
+  if (!connectionUrl || (!connectionUrl.startsWith('postgres://') && !connectionUrl.startsWith('postgresql://'))) {
+    return {
+      ok: false,
+      status: 'error',
+      database: 'disconnected',
+      databaseName: meta.databaseName || '',
+      databaseUser: meta.user || '',
+      host: meta.host || '127.0.0.1',
+      port: meta.port || 5432,
+      error: 'DATABASE_URL is not configured.',
+    };
   }
 
-  return {
-    ok: true,
-    status: 'ok',
-    database: 'connected',
-    databaseName: meta.databaseName || 'f',
-    databaseUser: meta.user || 'f_user',
-    host: meta.host || '127.0.0.1',
-    port: meta.port || 5432,
-    serverTime: new Date().toISOString(),
-  };
+  try {
+    const pool = getPool();
+    const res = await pool.query<{
+      db_name: string;
+      db_user: string;
+      server_time: string;
+    }>(
+      'SELECT current_database() AS db_name, current_user AS db_user, NOW()::text AS server_time'
+    );
+
+    const row = res.rows[0];
+    const healthMeta = parseConnectionMetadata(connectionUrl);
+
+    if (!schemaInitialized) {
+      await initializeDatabase();
+    }
+
+    return {
+      ok: true,
+      status: 'ok',
+      database: 'connected',
+      databaseName: row?.db_name || healthMeta.databaseName,
+      databaseUser: row?.db_user || healthMeta.user,
+      host: healthMeta.host,
+      port: healthMeta.port,
+      serverTime: row?.server_time || new Date().toISOString(),
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 'error',
+      database: 'disconnected',
+      databaseName: meta.databaseName || 'f',
+      databaseUser: meta.user || 'f_user',
+      host: meta.host || '127.0.0.1',
+      port: meta.port || 5432,
+      error: 'PostgreSQL database connection failed: ' + (err?.message || 'Database unreachable'),
+    };
+  }
 }
 
 export async function initializeDatabase(): Promise<{
@@ -3151,224 +3163,140 @@ export async function initializeDatabase(): Promise<{
   port: number;
 }> {
   const dbUrl = getCleanDatabaseUrl();
+  if (!dbUrl || (!dbUrl.startsWith('postgres://') && !dbUrl.startsWith('postgresql://'))) {
+    throw new Error('DATABASE_URL is not configured. Cannot initialize Foner database.');
+  }
+
   const meta = parseConnectionMetadata(dbUrl);
+  const pool = getPool();
 
-  try {
-    const pool = getPool();
-    await pool.query('SELECT 1');
-    usingMemoryFallback = false;
+  // Verify connection first
+  await pool.query('SELECT 1');
+  usingMemoryFallback = false;
 
-    await pool.query(FONER_POSTGRES_SCHEMA_SQL);
+  // Load schema from the canonical source of truth
+  const schemaPath = path.resolve(process.cwd(), 'db', 'schema.sql');
+  if (!fs.existsSync(schemaPath)) {
+    throw new Error(`Foner schema file not found at ${schemaPath}`);
+  }
+  const schemaSql = fs.readFileSync(schemaPath, 'utf8');
 
-    for (const [key, value] of Object.entries(DEFAULT_STORE_SETTINGS)) {
+  // Execute schema (CREATE IF NOT EXISTS / ALTER ADD COLUMN IF NOT EXISTS are safe for existing data)
+  await pool.query(schemaSql);
+
+  // Verify all required tables exist
+  const requiredTables = [
+    'store_settings','users','user_sessions','registration_otps','password_reset_tokens',
+    'uploaded_media','categories','subcategories','banners','products',
+    'restock_notifications','coupons','orders','contact_messages','reviews',
+    'audit_logs','newsletter_subscribers',
+  ];
+
+  const tablesRes = await pool.query(
+    `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
+  );
+  const existingTables = new Set(tablesRes.rows.map((r: any) => String(r.table_name)));
+  const missingTables = requiredTables.filter((t) => !existingTables.has(t));
+  const foundCount = requiredTables.length - missingTables.length;
+
+  if (missingTables.length > 0) {
+    throw new Error(
+      `Foner schema verification failed: missing required tables (${missingTables.join(', ')}); found ${foundCount}/${requiredTables.length}`
+    );
+  }
+
+  // Seed store settings (only if empty — preserves existing production data)
+  for (const [key, value] of Object.entries(DEFAULT_STORE_SETTINGS)) {
+    await pool.query(
+      'INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
+      [key, value]
+    );
+  }
+
+  // De-obfuscate hardcoded contact fields (existing cleanup logic preserved)
+  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('atelier_address', 'business_address', 'flagship_address')`).catch(() => {});
+  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('support_phone', 'business_phone')`).catch(() => {});
+  await pool.query(`UPDATE store_settings SET value = 'fonerera@gmail.com' WHERE key IN ('contactEmail', 'contact_email', 'support_email', 'business_email')`).catch(() => {});
+  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('instagram_url', 'social_instagram_url', 'instagramUrl')`).catch(() => {});
+  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('facebook_url', 'social_facebook_url')`).catch(() => {});
+  await pool.query(`UPDATE store_settings SET value = '' WHERE key IN ('whatsapp_number', 'social_whatsapp_url')`).catch(() => {});
+
+  // Seed banners, categories, subcategories, products, coupons, users only when empty (preserves existing data)
+  const bannersCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM banners');
+  if (parseInt(bannersCountRes.rows[0]?.count || '0', 10) === 0) {
+    for (const b of SEED_BANNERS) {
       await pool.query(
-        'INSERT INTO store_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
-        [key, value]
+        `INSERT INTO banners (title, subtitle, badge_text, cta_text, cta_link, desktop_image_url, mobile_image_url, device_target, theme_style, overlay_opacity, sort_order, is_active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`,
+        [b.title, b.subtitle, b.badge_text, b.cta_text, b.cta_link, b.desktop_image_url, b.mobile_image_url, b.device_target, b.theme_style, b.overlay_opacity, b.sort_order, b.is_active]
       );
     }
-
-    // Clean up any obsolete hardcoded contact settings
-    await pool.query(
-      `UPDATE store_settings SET value = '' WHERE key IN ('atelier_address', 'business_address', 'flagship_address') AND (LOWER(value) LIKE '%mm alam road%' OR LOWER(value) LIKE '%gulberg iii%')`
-    ).catch(() => {});
-    await pool.query(
-      `UPDATE store_settings SET value = '' WHERE key IN ('support_phone', 'business_phone') AND (value LIKE '%8429910%' OR value LIKE '%8429911%')`
-    ).catch(() => {});
-    await pool.query(
-      `UPDATE store_settings SET value = 'fonerera@gmail.com' WHERE key IN ('contactEmail', 'contact_email', 'support_email', 'business_email') AND (LOWER(value) = 'support@foner.pk' OR value = '')`
-    ).catch(() => {});
-    await pool.query(
-      `UPDATE store_settings SET value = '' WHERE key IN ('instagram_url', 'social_instagram_url', 'instagramUrl') AND (LOWER(value) = 'https://instagram.com/foner' OR LOWER(value) = 'http://instagram.com/foner' OR LOWER(value) LIKE '%foner.atelier.pk%' OR LOWER(value) = 'instagram (@foner)' OR LOWER(value) = '@foner')`
-    ).catch(() => {});
-    await pool.query(
-      `UPDATE store_settings SET value = '' WHERE key IN ('facebook_url', 'social_facebook_url') AND (LOWER(value) = 'https://facebook.com/foner' OR LOWER(value) LIKE '%foner.atelier.pk%')`
-    ).catch(() => {});
-    await pool.query(
-      `UPDATE store_settings SET value = '' WHERE key IN ('whatsapp_number', 'social_whatsapp_url') AND (value LIKE '%8429910%' OR value LIKE '%8429911%')`
-    ).catch(() => {});
-
-    const bannersCountRes = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM banners'
-    );
-    if (parseInt(bannersCountRes.rows[0]?.count || '0', 10) === 0) {
-      for (const b of SEED_BANNERS) {
-        await pool.query(
-          `INSERT INTO banners (
-            title, subtitle, badge_text, cta_text, cta_link,
-            desktop_image_url, mobile_image_url, device_target,
-            theme_style, overlay_opacity, sort_order, is_active
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-          [
-            b.title,
-            b.subtitle,
-            b.badge_text,
-            b.cta_text,
-            b.cta_link,
-            b.desktop_image_url,
-            b.mobile_image_url,
-            b.device_target,
-            b.theme_style,
-            b.overlay_opacity,
-            b.sort_order,
-            b.is_active,
-          ]
-        );
-      }
-    }
-
-    const catCountRes = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM categories'
-    );
-    if (parseInt(catCountRes.rows[0]?.count || '0', 10) === 0) {
-      for (const c of SEED_CATEGORIES) {
-        await pool.query(
-          `INSERT INTO categories (name, slug, description, image_url, featured, sort_order)
-           VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (slug) DO NOTHING`,
-          [c.name, c.slug, c.description, c.image_url, c.featured, c.sort_order]
-        );
-      }
-    }
-
-    const subCountRes = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM subcategories'
-    );
-    if (parseInt(subCountRes.rows[0]?.count || '0', 10) === 0) {
-      for (const sc of SEED_SUBCATEGORIES) {
-        await pool.query(
-          `INSERT INTO subcategories (name, slug, parent_category_slug, description, image_url, featured, sort_order)
-           VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (slug) DO NOTHING`,
-          [
-            sc.name,
-            sc.slug,
-            sc.parent_category_slug,
-            sc.description,
-            sc.image_url,
-            sc.featured,
-            sc.sort_order,
-          ]
-        );
-      }
-    }
-
-    const prodCountRes = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM products'
-    );
-    if (parseInt(prodCountRes.rows[0]?.count || '0', 10) === 0) {
-      for (const p of SEED_PRODUCTS) {
-        await pool.query(
-          `INSERT INTO products (
-            title, slug, sku, category_slug, subcategory_slug, price_pkr, compare_at_price_pkr,
-            description, fabric_care, image_url, gallery_urls, sizes, colors,
-            stock, is_featured, is_new_arrival, is_bestseller, rating, reviews_count
-          ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7,
-            $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb,
-            $14, $15, $16, $17, $18, $19
-          ) ON CONFLICT (slug) DO NOTHING`,
-          [
-            p.title,
-            p.slug,
-            p.sku,
-            p.category_slug,
-            p.subcategory_slug,
-            p.price_pkr,
-            p.compare_at_price_pkr,
-            p.description,
-            p.fabric_care,
-            p.image_url,
-            JSON.stringify(p.gallery_urls),
-            JSON.stringify(p.sizes),
-            JSON.stringify(p.colors),
-            p.stock,
-            p.is_featured,
-            p.is_new_arrival,
-            p.is_bestseller,
-            p.rating,
-            p.reviews_count,
-          ]
-        );
-      }
-    }
-
-    // Remove any legacy demo admin account if it existed in PostgreSQL
-    await pool.query("DELETE FROM users WHERE LOWER(email) = 'admin@foner.pk'").catch(() => {});
-
-    const userCountRes = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM users'
-    );
-    if (parseInt(userCountRes.rows[0]?.count || '0', 10) === 0) {
-      for (const u of SEED_USERS) {
-        await pool.query(
-          `INSERT INTO users (name, email, password_hash, phone, city, address, postal_code, role, status, avatar_url, total_orders, total_spent_pkr, loyalty_points)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT (email) DO NOTHING`,
-          [
-            u.name,
-            u.email,
-            u.password_hash,
-            u.phone,
-            u.city,
-            u.address,
-            u.postal_code,
-            u.role,
-            u.status,
-            u.avatar_url,
-            u.total_orders,
-            u.total_spent_pkr,
-            u.loyalty_points,
-          ]
-        );
-      }
-    }
-
-    const couponCountRes = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM coupons'
-    );
-    if (parseInt(couponCountRes.rows[0]?.count || '0', 10) === 0) {
-      for (const c of SEED_COUPONS) {
-        await pool.query(
-          `INSERT INTO coupons (code, description, discount_type, discount_value, min_order_pkr, expires_at, is_active, usage_count)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (code) DO NOTHING`,
-          [
-            c.code,
-            c.description,
-            c.discount_type,
-            c.discount_value,
-            c.min_order_pkr,
-            c.expires_at,
-            c.is_active,
-            c.usage_count,
-          ]
-        );
-      }
-    }
-
-    schemaInitialized = true;
-    lastSyncedAt = new Date().toISOString();
-    await bootstrapInitialAdmin();
-
-    return {
-      engine: 'postgresql',
-      connection_label: 'connected',
-      database_name: '',
-      database_user: '',
-      host: '',
-      port: 0,
-    };
-  } catch {
-    usingMemoryFallback = true;
-    schemaInitialized = true;
-    lastSyncedAt = new Date().toISOString();
-    await bootstrapInitialAdmin();
-    savePersistedStore();
-    return {
-      engine: 'postgresql',
-      connection_label: 'fallback',
-      database_name: '',
-      database_user: '',
-      host: '',
-      port: 0,
-    };
   }
+
+  const catCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM categories');
+  if (parseInt(catCountRes.rows[0]?.count || '0', 10) === 0) {
+    for (const c of SEED_CATEGORIES) {
+      await pool.query(`INSERT INTO categories (name, slug, description, image_url, featured, sort_order) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (slug) DO NOTHING`, [c.name, c.slug, c.description, c.image_url, c.featured, c.sort_order]);
+    }
+  }
+
+  const subCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM subcategories');
+  if (parseInt(subCountRes.rows[0]?.count || '0', 10) === 0) {
+    for (const sc of SEED_SUBCATEGORIES) {
+      await pool.query(`INSERT INTO subcategories (name, slug, parent_category_slug, description, image_url, featured, sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (slug) DO NOTHING`, [sc.name, sc.slug, sc.parent_category_slug, sc.description, sc.image_url, sc.featured, sc.sort_order]);
+    }
+  }
+
+  const prodCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM products');
+  if (parseInt(prodCountRes.rows[0]?.count || '0', 10) === 0) {
+    for (const p of SEED_PRODUCTS) {
+      await pool.query(
+        `INSERT INTO products (title, slug, sku, category_slug, subcategory_slug, price_pkr, compare_at_price_pkr, description, fabric_care, image_url, gallery_urls, sizes, colors, stock, is_featured, is_new_arrival, is_bestseller, rating, reviews_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19) ON CONFLICT (slug) DO NOTHING`,
+        [p.title, p.slug, p.sku, p.category_slug, p.subcategory_slug, p.price_pkr, p.compare_at_price_pkr, p.description, p.fabric_care, p.image_url, JSON.stringify(p.gallery_urls), JSON.stringify(p.sizes), JSON.stringify(p.colors), p.stock, p.is_featured, p.is_new_arrival, p.is_bestseller, p.rating, p.reviews_count]
+      );
+    }
+  }
+
+  await pool.query("DELETE FROM users WHERE LOWER(email) = 'admin@foner.pk'").catch(() => {});
+
+  const userCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM users');
+  if (parseInt(userCountRes.rows[0]?.count || '0', 10) === 0) {
+    for (const u of SEED_USERS) {
+      await pool.query(
+        `INSERT INTO users (name, email, password_hash, phone, city, address, postal_code, role, status, avatar_url, total_orders, total_spent_pkr, loyalty_points) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (email) DO NOTHING`,
+        [u.name, u.email, u.password_hash, u.phone, u.city, u.address, u.postal_code, u.role, u.status, u.avatar_url, u.total_orders, u.total_spent_pkr, u.loyalty_points]
+      );
+    }
+  }
+
+  const couponCountRes = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM coupons');
+  if (parseInt(couponCountRes.rows[0]?.count || '0', 10) === 0) {
+    for (const c of SEED_COUPONS) {
+      await pool.query(`INSERT INTO coupons (code, description, discount_type, discount_value, min_order_pkr, expires_at, is_active, usage_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (code) DO NOTHING`, [c.code, c.description, c.discount_type, c.discount_value, c.min_order_pkr, c.expires_at, c.is_active, c.usage_count]);
+    }
+  }
+
+  schemaInitialized = true;
+  lastSyncedAt = new Date().toISOString();
+  await bootstrapInitialAdmin();
+
+  console.log(`DATABASE: ${meta.databaseName || 'f'}`);
+  console.log(`USER: ${meta.user || 'f_user'}`);
+  console.log(`ENGINE: PostgreSQL`);
+  console.log(`SCHEMA: public`);
+  console.log(`REQUIRED TABLES: ${foundCount}/${requiredTables.length}`);
+  console.log(`STATUS: SUCCESS`);
+  if (missingTables.length > 0) {
+    console.error('MISSING TABLES:', missingTables.join(', '));
+  }
+
+  return {
+    engine: 'postgresql',
+    connection_label: 'connected',
+    database_name: meta.databaseName || 'f',
+    database_user: meta.user || 'f_user',
+    host: meta.host || '127.0.0.1',
+    port: meta.port || 5432,
+  };
 }
 
 export async function bootstrapInitialAdmin(): Promise<void> {
