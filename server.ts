@@ -20,10 +20,6 @@ import {
   getDatabaseStatusInfo,
   logAudit,
   REQUIRED_TABLES,
-  SEED_BANNERS,
-  SEED_CATEGORIES,
-  SEED_SUBCATEGORIES,
-  SEED_PRODUCTS,
   DEFAULT_FAQ_LIST,
   DEFAULT_FOOTER_SECTIONS,
   DEFAULT_INFORMATIONAL_PAGES,
@@ -894,12 +890,17 @@ function normalizeUser(u: any) {
   const { password_hash: _ignored, ...safeUser } = u;
   const validRoles = ['admin', 'manager', 'editor', 'customer'];
   const normalizedRole = validRoles.includes(u.role) ? u.role : 'customer';
+  const rawAvatarUrl = String(u.avatar_url || '').trim();
+  const avatarUrl = rawAvatarUrl ? (rawAvatarUrl.startsWith('/') ? rawAvatarUrl : `/uploads/${rawAvatarUrl}`) : '';
+  const avatar = avatarUrl || '/favicon.svg';
   const normalizedStatus = u.status === 'suspended' ? 'suspended' : 'active';
   return {
     ...safeUser,
     id: Number(u.id),
     role: normalizedRole,
     status: normalizedStatus,
+    avatar_url: avatarUrl,
+    avatar,
     postal_code: u.postal_code || '',
     total_orders: Number(u.total_orders || 0),
     total_spent_pkr: totalSpent,
@@ -2526,6 +2527,93 @@ async function startServer() {
 
   app.post('/api/auth/logout', logoutHandler);
   app.post('/api/auth/customer/logout', logoutHandler);
+
+  // Avatar endpoints — reuse existing upload validation; only authenticated user can modify own avatar
+  const avatarPatchHandler: express.RequestHandler = async (req, res) => {
+    try {
+      const verification = await verifySessionRoleFromDb(req);
+      if (!verification.authenticated || !verification.user) {
+        return res.status(401).json({ error: 'Not authenticated.' });
+      }
+      const userId = Number(verification.user.id);
+      const { data_url } = req.body || {};
+      if (!data_url || typeof data_url !== 'string' || !data_url.startsWith('data:image/')) {
+        return res.status(400).json({ error: 'Valid image data_url is required.' });
+      }
+      const match = data_url.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,([A-Za-z0-9+/=\r\n]+)$/);
+      if (!match) {
+        return res.status(400).json({ error: 'Invalid base64 image format.' });
+      }
+      const declaredMime = match[1].toLowerCase();
+      if (!ALLOWED_IMAGE_MIMES[declaredMime]) {
+        return res.status(400).json({ error: 'Unsupported image format.' });
+      }
+      const buffer = Buffer.from(match[2], 'base64');
+      if (!buffer || buffer.length === 0 || buffer.length > 2 * 1024 * 1024) {
+        return res.status(400).json({ error: 'Image must be between 1 byte and 2 MB.' });
+      }
+      const magicCheck = verifyImageMagicBytes(buffer, declaredMime);
+      if (!magicCheck.valid) {
+        return res.status(400).json({ error: 'Invalid or corrupted image file signature.' });
+      }
+      const uniqueFilename = `avatar_${userId}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.${magicCheck.ext}`;
+      const uploadsDir = path.resolve(__dirname, '..', 'uploads');
+      const resolvedPath = path.resolve(uploadsDir, uniqueFilename);
+      if (!resolvedPath.startsWith(uploadsDir + path.sep)) {
+        return res.status(400).json({ error: 'Invalid storage path.' });
+      }
+      if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+      fs.writeFileSync(resolvedPath, buffer, { mode: 0o644 });
+      const normalizedDataUrl = `data:${magicCheck.canonicalMime};base64,${buffer.toString('base64')}`;
+      await dbQuery(
+        `INSERT INTO uploaded_media (filename, mime_type, data_url)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (filename) DO UPDATE SET mime_type = EXCLUDED.mime_type, data_url = EXCLUDED.data_url`,
+        [uniqueFilename, magicCheck.canonicalMime, normalizedDataUrl]
+      );
+      await dbQuery('UPDATE users SET avatar_url = $1 WHERE id = $2', [uniqueFilename, userId]);
+      const updated = await dbQuery('SELECT * FROM users WHERE id = $1', [userId]);
+      return res.status(200).json({ success: true, user: normalizeUser(updated.rows[0]), avatar_url: uniqueFilename });
+    } catch (err: any) {
+      console.error('[Avatar Patch Error]', err?.message || err);
+      return res.status(500).json({ error: 'Avatar upload failed.' });
+    }
+  };
+
+  const avatarDeleteHandler: express.RequestHandler = async (req, res) => {
+    try {
+      const verification = await verifySessionRoleFromDb(req);
+      if (!verification.authenticated || !verification.user) {
+        return res.status(401).json({ error: 'Not authenticated.' });
+      }
+      const userId = Number(verification.user.id);
+      const userRes = await dbQuery('SELECT avatar_url FROM users WHERE id = $1', [userId]);
+      if (userRes.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found.' });
+      }
+      const oldFile = String(userRes.rows[0].avatar_url || '').trim();
+      if (oldFile) {
+        await dbQuery('UPDATE users SET avatar_url = \'\' WHERE id = $1', [userId]);
+        try {
+          const uploadsDir = path.resolve(__dirname, '..', 'uploads');
+          const resolvedPath = path.resolve(uploadsDir, oldFile);
+          if (resolvedPath.startsWith(uploadsDir + path.sep) && fs.existsSync(resolvedPath)) {
+            fs.unlinkSync(resolvedPath);
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+      const updated = await dbQuery('SELECT * FROM users WHERE id = $1', [userId]);
+      return res.status(200).json({ success: true, user: normalizeUser(updated.rows[0]) });
+    } catch (err: any) {
+      console.error('[Avatar Delete Error]', err?.message || err);
+      return res.status(500).json({ error: 'Avatar removal failed.' });
+    }
+  };
+
+  app.patch('/api/auth/avatar', requireAuth, avatarPatchHandler);
+  app.delete('/api/auth/avatar', requireAuth, avatarDeleteHandler);
 
   app.put('/api/auth/profile', requireAuth, async (req, res) => {
     try {
