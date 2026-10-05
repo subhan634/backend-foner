@@ -961,7 +961,9 @@ function computeCsrfToken(sessionToken: string): string {
 }
 
 function isSecureRequest(req: express.Request): boolean {
-  if (process.env.NODE_ENV === 'production') return true;
+  const env = process.env.NODE_ENV;
+  if (env === 'development') return false;
+  if (env === 'production') return true;
   if (req.secure) return true;
   const proto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
   if (proto.includes('https')) return true;
